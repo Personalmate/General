@@ -1,0 +1,408 @@
+create or replace task COL_DB.COL_DM.B2B2C_PROMO_DECOUPLING_NEW
+	warehouse=COL_WH
+	schedule='USING CRON 0 11 * * 4 Australia/Melbourne'
+	as BEGIN
+    ---------------------------------------------------------
+    /* GENERATE B2B2C PROMO MASTER VIEW FOR CURRENT WEEK */
+    ---------------------------------------------------------
+    CALL COL_DB.COL_DM.POPULATE_B2B2C_PROMO_MASTER();
+
+    ---------------------------------------------------------
+    /* EXPORT B2B2C PROMO DECOUPLING JOURNAL EXTRACTS */
+    ---------------------------------------------------------
+
+    CALL B2B2C_PROMO_DECOUP_GL_EXTRACT();           -- 1. GL Extract by Store
+    CALL B2B2C_PROMO_DECOUP_AP_SUPPORTING();        -- 2. AP Supporting Doc
+    CALL B2B2C_PROMO_DECOUP_DEBIT_NOTE_EXTRACT();   -- 3. Debit Note Extract
+    CALL B2B2C_PROMO_DECOUP_AP_JOURNAL();           -- 4. AP Journal
+    CALL B2B2C_PROMO_DECOUP_GL_JOURNAL();           -- 5. GL Journal
+    CALL B2B2C_PROMO_DECOUP_SSD_FILES();            -- 6. SSD Files
+
+    ---------------------------------------------------------
+    /* NOTIFY THAT ALL JOURNALS EXTRACTED SUCCESSFULLY */
+    ---------------------------------------------------------
+    COPY INTO @COL_DB.COL_DM.B2B2C_PROMO_DECOUP/Status/Promo_Decoupling_Status.csv
+    FROM (SELECT 'SUCCESSFULL' AS PROMO_DECOUPLING_STATUS)
+    FILE_FORMAT = (TYPE = CSV, COMPRESSION = NONE, FIELD_OPTIONALLY_ENCLOSED_BY = '"')
+    HEADER      = FALSE
+    SINGLE      = TRUE
+    OVERWRITE   = TRUE;
+END;
+
+
+create or replace task COL_DB.COL_DM.B2B2C_PROMO_DECOUPLING
+	warehouse=COL_WH
+	schedule='USING CRON 0 11 * * 4 Australia/Melbourne'
+	as EXECUTE IMMEDIATE
+$$
+    BEGIN        
+        
+        /*******************************************************
+                        B2B2C PROMO DECOUPLING
+        *******************************************************/
+        
+        
+        /*
+            B2B2C Promo Decoupling generates the finance journals to process the reversal of promotional income relating to B2B2C transactions.
+            
+            This script:
+                - Is run every Thursday (as B2B2C data is made available t-2 days)
+                - Extracts promotional income for the current promo week (Wed - Tues)
+                - Filters for B2B2C transactions only (based on MATCHED data provided by partners)
+                - Joins to create a 'promo master' table with all relevant info for journal creation
+                - Generates 6 extracts:
+                    1. GL Extract by Store
+                    2. AP Supporting Doc
+                    3. Debit Note Extract
+                    4. AP Journal
+                    5. GL Journal
+                    6. Supplier Supporting Docs (SSD)
+                - The 5 extracts are then exported to Azure Blob Storage, which are then copied to Sharepoint (accessible for finance users)
+                - A 6th extract is generated via a For Loop for each Supplier ID, exported to Azure Blob Storage and then copied to Sharepoint
+        */
+        
+        
+        ---------------------------------------------------------
+        /* GENERATE B2B2C PROMO MASTER VIEW FOR CURRENT WEEK */
+        ---------------------------------------------------------
+        
+        
+        ALTER SESSION SET DATE_INPUT_FORMAT = 'DD.MM.YYYY';     --setting session date format
+        ALTER SESSION SET DATE_OUTPUT_FORMAT = 'DD.MM.YYYY';    --setting session date format
+        
+        USE DATABASE COL_DB;                                    --used for temp tables
+        USE SCHEMA COL_DM;                                      --used for temp tables
+        
+        TRUNCATE TABLE COL_DB.COL_DM.B2B2C_PROMO_MASTER;
+        
+        
+        ALTER WAREHOUSE COL_WH SET warehouse_size = XXLARGE;    --query is very large so need to maximize warehouse size
+        
+        INSERT INTO COL_DB.COL_DM.B2B2C_PROMO_MASTER
+        WITH PROMO_WEEK_CTE
+        AS (
+            SELECT 
+            date.PRMTN_WK_ID AS CURR_PROMO_WK_ID,
+            DATEADD(DAY,5,date.DAY_DT) AS ADVICE_END_DATE,
+            DATEADD(DAY,-1,date.DAY_DT) AS ADVICE_START_DATE,
+            date2.DAY_DT AS PROMO_START_DATE,
+            date2.COLES_FIN_WK_ID AS FINANCIAL_WEEK,
+            date2.YR_ID AS FINANCIAL_YEAR
+            
+            FROM DB_CORE_DATAPROD_REFERENCE_PRD.TIME.TIME_DAY_REF_V date
+        
+            INNER JOIN DB_CORE_DATAPROD_REFERENCE_PRD.TIME.TIME_DAY_REF_V date2 ON DATEADD(DAY,-6,date.DAY_DT) = date2.DAY_DT
+        
+            WHERE  
+            date.DAY_DT = CURRENT_DATE()-2                      --TUESDAY OF PROMO WEEK END
+            
+            ),
+        
+        DEAL_CLAIM 
+        AS (
+            SELECT DISTINCT
+                B.SALE_TYPE_CDE,
+                f.DEAL_IDENTIFIER,
+                f.TRANSACTION_IDENTIFIER,
+                f.TRANSACTION_END_DAY_IDNT,
+                date.PRMTN_WK_START_DT,
+                date.PRMTN_WK_END_DT,
+                DATEADD(DAY,5,date.PRMTN_WK_END_DT) AS DOCUMENT_DATE,
+                DATEADD(DAY,2,date.PRMTN_WK_END_DT) AS POSTING_DATE,
+                date.WK_START_DT AS WEEK_COMMENCING,
+                f.TRANSACTION_ITEM_LINE_SEQUENCE_NUMBER,
+                f.ORDER_IDENTIFIER,
+                f.INVOICE_IDENTIFIER,
+                f.ITEM_IDENTIFIER,
+                CASE 
+                    WHEN LEN(f.LOCATION_IDENTIFIER) = 3
+                    THEN CONCAT('0',f.LOCATION_IDENTIFIER)
+                    ELSE f.LOCATION_IDENTIFIER
+                END AS LOCATION_IDENTIFIER,
+                prmtn_det.PRMTN_HEAD_IDNT AS PROMO_ID,
+                prmtn_det.PRMTN_COMP_IDNT AS PROMO_COMP_ID,
+                prmtn_det.PRMTN_COMP_DTL_KEY AS RPM_PROMO_COMP_DETAIL_ID,
+                f.PROMO_COMP_DETAIL_IDENTIFIER,
+                f.COLES_ONLINE_EXCLUSIVE_PROMOTION_DISCOUNT_FLAG,
+                f.SALES_CHANNEL_CODE,
+                f.TRANSACTION_DATE,
+                f.DEAL_INCOME_AMOUNT,
+                b.F_SLS_AMT AS AMOUNT_EX_GST,
+                b.F_SLS_QTY AS QTY
+                
+            FROM DB_CORE_DATAPROD_COMM_360_PRD.SENSITIVE.TRANSACTION_ITEM_LINE_DEAL_CLAIM_ATM_V f
+        
+            LEFT JOIN DB_CORE_DATAPROD_COMM_360_PRD.SENSITIVE.SLS_TRAN_LINE_LD_V B
+                    ON  f.transaction_date = B.DAY_DT
+                    AND f.TRANSACTION_ITEM_LINE_SEQUENCE_NUMBER = B.LINE_ITEM_SEQ_NO
+                    AND f.ITEM_IDENTIFIER = B.ITEM_ID
+                    AND f.TRANSACTION_IDENTIFIER = B.TRANSACTION_ID 
+            
+            INNER JOIN DB_CORE_PRD.PSG.CML_PRMTN_COMP_DETAIL_DM prmtn_det ON prmtn_det.PRMTN_COMP_DTL_KEY =  f.PROMO_COMP_DETAIL_IDENTIFIER 
+        
+            INNER JOIN DB_CORE_DATAPROD_REFERENCE_PRD.TIME.TIME_DAY_REF_V date ON f.TRANSACTION_END_DAY_IDNT = date.DAY_ID
+        
+            INNER JOIN DB_CORE_DATAPROD_REFERENCE_PRD.TIME.TIME_DAY_REF_V finweek ON date.PRMTN_WK_START_DT = finweek.DAY_DT
+        
+            INNER JOIN COL_DB.COL_DM.VW_B2B2C_DIFFPRICE_TRANSACTIONS b2b2c 
+                       ON f.TRANSACTION_IDENTIFIER = b2b2c.TRANSACTION_ID
+                       AND TO_NUMBER(f.LOCATION_IDENTIFIER) = TO_NUMBER(b2b2c.STORE_ID)
+                
+            WHERE        
+                date.PRMTN_WK_ID = (SELECT CURR_PROMO_WK_ID FROM PROMO_WEEK_CTE)
+                AND f.PROMO_COMP_DETAIL_IDENTIFIER <> -1
+                
+            ),
+            
+        DEAL_INCOME_ITEM_LD_V 
+        AS (
+            SELECT DISTINCT 
+                di.DEAL_ID,
+                di.ITEM_ID,
+                di.LOC_ID,
+                di.DAY_DT,
+                di.CHANNEL_TYPE_CDE,
+                di.CLAIM_TYPE_CDE,
+                di.SUPP_ID,
+                di.DEAL_SUPP_ID,
+                di.F_SUPP_DEAL_UNIT_AMT,
+                di.SALE_TYPE_CDE
+                
+            FROM DB_CORE_DATAPROD_COMM_360_PRD.SENSITIVE.DEAL_INCOME_ITEM_LD_V DI
+        
+            INNER JOIN DB_CORE_DATAPROD_REFERENCE_PRD.TIME.TIME_DAY_REF_V date ON DI.DAY_DT = date.DAY_DT
+        
+            WHERE 
+            CLAIM_TYPE_CDE IN ('PSCW', 'PSCD') 
+            AND date.PRMTN_WK_ID = (SELECT CURR_PROMO_WK_ID FROM PROMO_WEEK_CTE)
+            
+            ),
+        
+        B2B2C_PROMO_DECOUP_VENDOR_MASTER
+        AS
+            (
+                SELECT
+                MIN(CCODE) AS CCODE,
+                VENDOR,
+                "Pervious No.",
+                "Vendor Name 1",
+                ABN,
+                "Overseas Supplier"
+                
+                FROM COL_DB.COL_DM.B2B2C_PROMO_DECOUP_VENDOR_MASTER
+        
+                WHERE "Pervious No." IS NOT NULL
+        
+                GROUP BY 
+                VENDOR,
+                "Pervious No.",
+                "Vendor Name 1",
+                ABN,
+                "Overseas Supplier"
+            )
+            
+        SELECT DISTINCT
+        
+            a.TRANSACTION_IDENTIFIER,
+            a.TRANSACTION_ITEM_LINE_SEQUENCE_NUMBER,
+            a.TRANSACTION_DATE,
+            a.SALES_CHANNEL_CODE,
+            a.DEAL_IDENTIFIER AS DEAL_ID,
+            SUBSTR(A.PRMTN_WK_START_DT,1,2) || '.' || SUBSTR(A.PRMTN_WK_START_DT,4,2) || '.' || SUBSTR(A.PRMTN_WK_START_DT,7,4)
+                AS PROMO_START_DATE,
+            SUBSTR(A.PRMTN_WK_END_DT,1,2) || '.' || SUBSTR(A.PRMTN_WK_END_DT,4,2) || '.' || SUBSTR(A.PRMTN_WK_END_DT,7,4)
+                AS PROMO_END_DATE,
+            a.PROMO_ID,
+            a.PROMO_COMP_ID AS PROMO_COMPONENT_ID,
+            a.RPM_PROMO_COMP_DETAIL_ID AS PROMO_COMPONENT_DETAIL_ID,
+            'CS' AS BUSINESS,
+            SUBSTR(f.AREA_DESC,4,LEN(f.AREA_DESC) - 3) AS REGION,
+            a.LOCATION_IDENTIFIER AS STORE_ID,
+            f.LOC_DESC AS STORE_NAME,
+            d.TPC_DESC,
+            d.CATEGORY_ID,
+            d.CATEGORY_DESC,
+            d.SUB_CATEGORY_ID, 
+            d.SUB_CATEGORY_DESC,
+            d.CML_SIZE_DIFF_IDNT AS DIFFERENTIATOR,
+            a.ITEM_IDENTIFIER,
+            d.ITEM_SHORT_DESC,
+            d.ITEM_DESC AS ITEM_LONG_DESC,
+            SUBSTR(A.WEEK_COMMENCING,1,2) || '.' || SUBSTR(A.WEEK_COMMENCING,4,2) || '.' || SUBSTR(A.WEEK_COMMENCING,7,4)
+                AS WEEK_COMMENCING,
+            CASE 
+                WHEN SUM(b.F_SUPP_DEAL_UNIT_AMT) = 0
+                THEN 0
+                ELSE
+                    SUM(a.DEAL_INCOME_AMOUNT) / SUM(b.F_SUPP_DEAL_UNIT_AMT)
+            END AS TRANSACTION_UNITS,
+            SUM(b.F_SUPP_DEAL_UNIT_AMT) AS DEAL_UNIT_AMOUNT,
+            SUM(a.DEAL_INCOME_AMOUNT) AS DEAL_INCOME_AMOUNT_EX_GST,
+            d.CML_GST_RATE_PCT AS GST_RATE,
+            SUM(a.DEAL_INCOME_AMOUNT) * (1 + d.CML_GST_RATE_PCT / 100) AS DEAL_INCOME_AMOUNT_INC_GST,
+            'Coles Supermarkets Australia Pty Ltd' AS SAP_COMPANY_CODE,
+            b.SUPP_ID AS SUPPLIER_NUMBER,
+            c.SUPP_DESC AS SUPPLIER_DESC,
+            ven.ABN AS SUPPLIER_ABN,
+            CONCAT('B2B2C',b.SUPP_ID,SUBSTR(promowk.FINANCIAL_WEEK,5,2),SUBSTR(promowk.FINANCIAL_YEAR,3,2)) AS CLAIM_NUM,
+            SUBSTR(promowk.ADVICE_END_DATE,1,2) || '.' || SUBSTR(promowk.ADVICE_END_DATE,4,2) || '.' || SUBSTR(promowk.ADVICE_END_DATE,7,4)
+                AS ADVICE_CREATE_DATE,
+            SUBSTR(promowk.ADVICE_START_DATE,1,2) || '.' || SUBSTR(promowk.ADVICE_START_DATE,4,2) || '.' || SUBSTR(promowk.ADVICE_START_DATE,7,4)
+                AS ADVICE_START_DATE,
+            SUBSTR(promowk.ADVICE_END_DATE,1,2) || '.' || SUBSTR(promowk.ADVICE_END_DATE,4,2) || '.' || SUBSTR(promowk.ADVICE_END_DATE,7,4)
+                AS ADVICE_END_DATE,
+            b.CLAIM_TYPE_CDE AS CLAIM_TYPE,
+            CASE b.CLAIM_TYPE_CDE
+                WHEN 'PSCD' THEN 'Promotional Scan Deal - Direct'
+                WHEN 'PSCW' THEN 'Promotional Scan Deal - Warehouse'
+            END AS CLAIM_TYPE_DESC,
+            'Debit Advice - Adjustment Note' AS CLAIM_DOC_TYPE_DESC,
+            ven.VENDOR AS SAP_SUPPLIER_ID,
+            ven.CCODE AS COMPANY_CODE,
+            CASE ven.CCODE
+                WHEN '1055' THEN 'CGHPLOF'
+                WHEN '1061' THEN 'CHFLGOF'
+                WHEN '1059' THEN 'BHFBGOF'
+                WHEN '1099' THEN 'CHFNMOF'
+                WHEN '1097' THEN 'CHFCCOF'
+            END AS COST_CENTRE,
+            SUBSTR(A.DOCUMENT_DATE,1,2) || '.' || SUBSTR(A.DOCUMENT_DATE,4,2) || '.' || SUBSTR(A.DOCUMENT_DATE,7,4)
+                AS DOCUMENT_DATE,
+            '004 189 708' AS COLES_ACN,
+            '45 004 189 708' AS COLES_ABN,
+            'PO Box 2000, Glen Iris, VIC 3146' AS COLES_ADDRESS,
+            supp.CML_SUPP_ADDR_1 || ' ' || IFNULL(supp.CML_SUPP_ADDR_2,'') || ' ' || IFNULL(supp.CML_SUPP_ADDR_3,'') AS SUPPLIER_ADDR_1,
+            supp.CML_SUPP_CITY_NAME || ' ' || 
+            supp.CML_SUPP_ST_OR_PRVNC_CDE || ' ' || 
+            supp.CML_SUPP_PSTL_CDE AS SUPPLIER_ADDR_2,
+            
+            'AHORTIS' AS LAN_ID,
+            
+            'AUD' AS CURRENCY,
+            CASE d.CML_GST_RATE_PCT
+                WHEN 0 THEN 'P0'
+                ELSE 'P1'
+            END AS TAX_CODE,
+            '209903' AS DEAL_GL_ACC,
+            SUBSTR(A.POSTING_DATE,1,2) || '.' || SUBSTR(A.POSTING_DATE,4,2) || '.' || SUBSTR(A.POSTING_DATE,7,4)
+            AS POSTING_DATE,
+            supp.SUPP_CONTACT_EMAIL AS SUPPLIER_EMAIL,
+            supp.SUPP_CONTACT_NAME AS SUPPLIER_CONTACT,
+            '921019' AS DEAL_GL_SUS_ACC,
+            'A Hortis' AS COLES_CONTACT,    
+            'deal_confirmation@coles.com.au' AS COLES_EMAIL,
+            SUM(a.AMOUNT_EX_GST) AS B2B2C_SALES,
+            SUM(a.QTY) AS QTY
+            
+        
+        FROM DEAL_CLAIM a
+        
+        LEFT JOIN DB_CORE_DATAPROD_REFERENCE_PRD.PRODUCT.ITEM_ASIS_REF_V D ON a.ITEM_IDENTIFIER = d.ITEM_ID
+        
+        LEFT JOIN DEAL_INCOME_ITEM_LD_V b ON a.DEAL_IDENTIFIER = b.DEAL_ID
+                AND a.ITEM_IDENTIFIER = b.ITEM_ID
+                AND TO_DOUBLE(a.LOCATION_IDENTIFIER) = TO_DOUBLE(b.LOC_ID)
+                AND a.TRANSACTION_DATE = b.DAY_DT
+                AND a.SALES_CHANNEL_CODE = b.CHANNEL_TYPE_CDE
+                AND a.SALE_TYPE_CDE = b.SALE_TYPE_CDE
+        
+        LEFT JOIN DB_CORE_DATAPROD_REFERENCE_PRD.SUPPLIER.SUPPLIER_REF_V c ON b.SUPP_ID = c.SUPP_ID
+        
+        LEFT JOIN DB_CORE_PRD.PSG.SUPP_DM supp ON supp.SUPP_IDNT = b.SUPP_ID AND supp.DM_RECD_CURR_FLAG = 'Y'
+        
+        LEFT JOIN DB_CORE_DATAPROD_REFERENCE_PRD.LOCATION.LOCATION_ASIS_REF_V f ON TO_DOUBLE(a.location_identifier) = TO_DOUBLE(f.LOC_IDNT)
+        
+        LEFT JOIN DB_CORE_DATAPROD_REFERENCE_PRD.LOCATION.STORE_ATTR_REF_V store_att ON TO_DOUBLE(store_att.store_id) = TO_DOUBLE(a.LOCATION_identifier)
+        
+        LEFT JOIN B2B2C_PROMO_DECOUP_VENDOR_MASTER ven ON b.SUPP_ID = ven."Pervious No."
+        
+        CROSS JOIN PROMO_WEEK_CTE promowk
+        
+        WHERE 
+        ven."Overseas Supplier" <> 1 --removes suppliers who are overseas as currently no process in place to reverse promo deal income for overseas
+        AND ven.VENDOR IS NOT NULL --removes suppliers with no supplier ID
+        AND d.CATEGORY_ID NOT IN ('1182','7551','7641','7642','7719','7429') --these are categories not applicable to B2B2C
+        
+        GROUP BY
+            a.TRANSACTION_IDENTIFIER,
+            a.TRANSACTION_ITEM_LINE_SEQUENCE_NUMBER,
+            a.TRANSACTION_DATE,
+            a.SALES_CHANNEL_CODE,
+            a.INVOICE_IDENTIFIER,
+            b.CLAIM_TYPE_CDE,
+            a.PROMO_ID,
+            a.PROMO_COMP_ID,
+            a.RPM_PROMO_COMP_DETAIL_ID,
+            a.DEAL_IDENTIFIER,
+            a.ITEM_IDENTIFIER,
+            d.ITEM_SHORT_DESC,
+            d.ITEM_DESC,
+            d.CATEGORY_ID,
+            d.CATEGORY_DESC,	
+            d.TPC_DESC, 
+            d.SUB_CATEGORY_ID, 
+            d.SUB_CATEGORY_DESC,
+            d.CML_GST_RATE_PCT,
+            a.LOCATION_IDENTIFIER,
+            SUBSTR(f.AREA_DESC,4,LEN(f.AREA_DESC) - 3),
+            f.LOC_DESC,
+            b.SUPP_ID,
+            b.DEAL_SUPP_ID,
+            c.SUPP_DESC,
+            supp.CML_SUPP_ADDR_1,
+            supp.CML_SUPP_CITY_NAME,
+            supp.CML_SUPP_ST_OR_PRVNC_CDE,
+            supp.CML_SUPP_PSTL_CDE,
+            c.MASTER_SUPP_DESC,
+            d.CML_SIZE_DIFF_IDNT,
+            ven.VENDOR,
+            ven.ABN,
+            ven.CCODE,
+            a.PRMTN_WK_START_DT,
+            a.PRMTN_WK_END_DT,
+            supp.SUPP_CONTACT_EMAIL,
+            supp.SUPP_CONTACT_NAME,
+            a.WEEK_COMMENCING,
+            promowk.FINANCIAL_WEEK,
+            promowk.FINANCIAL_YEAR,
+            promowk.ADVICE_END_DATE,
+            promowk.ADVICE_START_DATE,
+            supp.CML_SUPP_ADDR_2,
+            supp.CML_SUPP_ADDR_3,
+            a.DOCUMENT_DATE,
+            a.POSTING_DATE
+            ;
+        
+        ALTER WAREHOUSE COL_WH SET warehouse_size = XSMALL;             --revert back to XS
+        
+        
+        ---------------------------------------------------------
+        /* EXPORT B2B2C PROMO DECOUPLING JOURNAL EXTRACTS */
+        ---------------------------------------------------------
+        
+        CALL B2B2C_PROMO_DECOUP_GL_EXTRACT(); --  1. GL Extract by Store
+        
+        CALL B2B2C_PROMO_DECOUP_AP_SUPPORTING(); --  2. AP Supporting Doc
+        
+        CALL B2B2C_PROMO_DECOUP_DEBIT_NOTE_EXTRACT(); --  3. Debit Note Extract
+        
+        CALL B2B2C_PROMO_DECOUP_AP_JOURNAL(); --  4. AP Journal
+        
+        CALL B2B2C_PROMO_DECOUP_GL_JOURNAL(); --  5. GL Journal
+        
+        CALL B2B2C_PROMO_DECOUP_SSD_FILES(); --  6. SSD Files
+        
+        
+        ---------------------------------------------------------
+        /*  NOTIFY THAT ALL JOURNALS EXTRACTED SUCCESSFULLY */
+        ---------------------------------------------------------
+        
+        COPY INTO @COL_DB.COL_DM.B2B2C_PROMO_DECOUP/Status/Promo_Decoupling_Status.csv
+        FROM (SELECT 'SUCCESSFULL' AS PROMO_DECOUPLING_STATUS)
+        FILE_FORMAT = (TYPE=CSV, COMPRESSION = NONE, FIELD_OPTIONALLY_ENCLOSED_BY = '"')
+        HEADER = FALSE
+        SINGLE = TRUE
+        OVERWRITE = TRUE;
+
+    END;
+$$;
