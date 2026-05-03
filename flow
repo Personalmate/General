@@ -1,0 +1,56 @@
+Environment
+Team Productivity Environment Restricted
+
+Overview
+The B2B2C - Promo Decoupling Flow creates and saves the weekly B2B2C Promo Decoupling files to a secure Sharepoint Online repository, created purely for this process.
+
+For more info on the Promo Decoupling process, see 
+B2B2C Promo Decoupling
+.
+
+Schedule/Trigger
+Flow is triggered based on when there is any new file added or modified to the folder ‘/b2b2c-transaction-files/Output Files/Status’.
+
+This Flow was designed to be used in conjunction with Snowflake task; COL_DB.COL_DM.B2B2C_PROMO_DECOUPLING. This task is run weekly (Thursday @ 11am) and it performs the data query that extracts the relevant data for the promotional week (Wednesday - Tuesday). The final step of this task is to update the file: b2b2c-transaction-files/Output Files/Status/Promo_Decoupling_Status.csv. 
+
+Therefore once the Promo Decoupling Snowflake task is executed (and successfully run) this flow is automatically kick started. For more info on the B2B2C_Promo_Decoupling task, see 
+Promo Decoupling - Technical Documentation.
+
+Flow
+image-20240913-061821.png
+image-20240913-061851.png
+image-20240913-061954.png
+image-20240913-062052.png
+image-20240913-062121.png
+Troubleshooting
+For the Flow to be triggered, the Snowflake B2B2C_Promo_Decoupling task needs to be first executed. If the Flow is not executed when it should be (approx 11:30am each Thursday) then first step is to check if Snowflake task was fully executed.
+
+Errors within the Flow itself, will likely come from altering any file or folder that is referenced within the Flow. As there are a number of files to be created (x2 SAP journals, x3 supporting files and n* x SSD files) a .txt file has been created, b2b2c-transaction-files/Output Files/Promo_Decoupling_Master_Folder_Names.txt, to store the relevant folder pairs between Azure Blob Storage and Sharepoint:
+
+
+
+{
+  "Data": [
+    {
+      "Blob_Name": "AP_Journal",
+      "Sharepoint_Name": "AP Journals"
+    },
+    {
+      "Blob_Name": "AP_Supporting_Doc",
+      "Sharepoint_Name": "AP Supporting Document"
+    },
+    {
+      "Blob_Name": "Debit_Note_Extract",
+      "Sharepoint_Name": "Debit Note Macro Data"
+    },
+   {
+      "Blob_Name": "GL_Extract",
+      "Sharepoint_Name": "GL Extract by Store"
+    },
+   {
+      "Blob_Name": "GL_Journal",
+      "Sharepoint_Name": "GL Journals"
+    }
+  ]
+}
+In the above .txt file, “Blob_Name” refers to folders stored in b2b2c-transaction-files/Output Files within our Azure Blob Storage, and “Sharepoint_Name” refers to folders stored in B2B2C Supplier Reports - B2B2C Data Extracts. 
